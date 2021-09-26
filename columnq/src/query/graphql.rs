@@ -1,7 +1,8 @@
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-use datafusion::logical_plan::{Expr, Operator};
+use datafusion::arrow;
+use datafusion::logical_plan::{Column, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 use graphql_parser::query::{parse_query, Definition, OperationDefinition, Selection, Value};
 
@@ -132,7 +133,7 @@ fn to_datafusion_predicates<'a, 'b>(
         Value::Object(obj) => obj
             .iter()
             .map(|(op, operand)| {
-                let col_expr = Box::new(Expr::Column(col.to_string()));
+                let col_expr = Box::new(Expr::Column(Column::from_name(col.to_string())));
                 let right_expr = Box::new(operand_to_datafusion_expr(operand)?);
                 match *op {
                     "eq" => Ok(Expr::BinaryExpr {
@@ -170,7 +171,7 @@ fn to_datafusion_predicates<'a, 'b>(
         // when filter is literal, default to equality comparison
         Value::Boolean(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => {
             Ok(vec![Expr::BinaryExpr {
-                left: Box::new(Expr::Column(col.to_string())),
+                left: Box::new(Expr::Column(Column::from_name(col.to_string()))),
                 op: Operator::Eq,
                 right: Box::new(operand_to_datafusion_expr(filter)?),
             }])
@@ -258,7 +259,7 @@ pub fn query_to_df(
 
     let mut df = dfctx
         .table(field.name)
-        .map_err(|e| QueryError::invalid_table(e, &field.name))?;
+        .map_err(|e| QueryError::invalid_table(e, field.name))?;
 
     // apply projection
     let column_names = field
@@ -349,7 +350,7 @@ pub async fn exec_query(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::*;
+    use datafusion::arrow::array::*;
     use datafusion::execution::context::ExecutionContext;
     use datafusion::logical_plan::{col, lit};
 

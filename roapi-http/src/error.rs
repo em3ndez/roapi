@@ -1,6 +1,10 @@
 use std::fmt;
 
+use actix_http::body::Body;
+use actix_http::Response;
 use actix_web::{http, HttpResponse};
+use columnq::datafusion::arrow;
+use columnq::datafusion::parquet;
 use columnq::error::QueryError;
 use serde::Serializer;
 use serde_derive::Serialize;
@@ -26,7 +30,23 @@ impl ApiErrResp {
         Self {
             code: http::StatusCode::INTERNAL_SERVER_ERROR,
             error: "json_serialization".to_string(),
-            message: "Failed to serialize record batches into json".to_string(),
+            message: "Failed to serialize record batches into JSON".to_string(),
+        }
+    }
+
+    pub fn csv_serialization(_: arrow::error::ArrowError) -> Self {
+        Self {
+            code: http::StatusCode::INTERNAL_SERVER_ERROR,
+            error: "csv_serialization".to_string(),
+            message: "Failed to serialize record batches into CSV".to_string(),
+        }
+    }
+
+    pub fn arrow_file_serialization(_: arrow::error::ArrowError) -> Self {
+        Self {
+            code: http::StatusCode::INTERNAL_SERVER_ERROR,
+            error: "arrow_file_serialization".to_string(),
+            message: "Failed to serialize record batches into arrow file".to_string(),
         }
     }
 
@@ -35,6 +55,14 @@ impl ApiErrResp {
             code: http::StatusCode::INTERNAL_SERVER_ERROR,
             error: "arrow_stream_serialization".to_string(),
             message: "Failed to serialize record batches into arrow stream".to_string(),
+        }
+    }
+
+    pub fn parquet_serialization(_: parquet::errors::ParquetError) -> Self {
+        Self {
+            code: http::StatusCode::INTERNAL_SERVER_ERROR,
+            error: "parquet_serialization".to_string(),
+            message: "Failed to serialize record batches into parquet".to_string(),
         }
     }
 
@@ -75,7 +103,7 @@ impl actix_web::error::ResponseError for ApiErrResp {
         self.code
     }
 
-    fn error_response(&self) -> HttpResponse {
+    fn error_response(&self) -> Response<Body> {
         HttpResponse::build(self.code).json(self)
     }
 }

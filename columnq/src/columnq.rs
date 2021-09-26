@@ -1,29 +1,33 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use datafusion::datasource::TableProvider;
+use datafusion::arrow;
+pub use datafusion::execution::context::ExecutionConfig;
+use datafusion::execution::context::ExecutionContext;
 
 use crate::error::{ColumnQError, QueryError};
 use crate::query;
 use crate::table::{self, TableSource};
 
 pub struct ColumnQ {
-    dfctx: datafusion::execution::context::ExecutionContext,
+    dfctx: ExecutionContext,
     schema_map: HashMap<String, arrow::datatypes::SchemaRef>,
 }
 
 impl ColumnQ {
     pub fn new() -> Self {
-        let dfctx = datafusion::execution::context::ExecutionContext::new();
+        Self::new_with_config(ExecutionConfig::default())
+    }
+
+    pub fn new_with_config(config: ExecutionConfig) -> Self {
+        let dfctx = ExecutionContext::with_config(config);
         let schema_map = HashMap::<String, arrow::datatypes::SchemaRef>::new();
         Self { dfctx, schema_map }
     }
 
     pub async fn load_table(&mut self, t: &TableSource) -> Result<(), ColumnQError> {
-        let table = table::load(&t).await?;
+        let table = table::load(t).await?;
         self.schema_map.insert(t.name.clone(), table.schema());
-        self.dfctx
-            .register_table(t.name.as_str(), Arc::new(table))?;
+        self.dfctx.register_table(t.name.as_str(), table)?;
 
         Ok(())
     }

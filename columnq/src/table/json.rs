@@ -1,8 +1,9 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
-use arrow::record_batch::RecordBatch;
+use datafusion::arrow;
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::value::Value;
 
 use crate::error::ColumnQError;
@@ -175,12 +176,10 @@ mod tests {
 
     #[tokio::test]
     async fn nested_struct_and_lists() -> Result<(), ColumnQError> {
-        let t = to_mem_table(&TableSource {
-            name: "spacex_launches".to_string(),
-            uri: test_data_path("spacex-launches.json"),
-            schema: None,
-            option: None,
-        })
+        let t = to_mem_table(&TableSource::new(
+            "spacex_launches".to_string(),
+            test_data_path("spacex_launches.json"),
+        ))
         .await?;
 
         let schema = t.schema();

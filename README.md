@@ -41,7 +41,7 @@ pre-built binaries for each platform. Pre-built docker images are also available
 ### Install from source
 
 ```bash
-cargo install --git https://github.com/roapi/roapi --branch main --bin roapi-http
+cargo install --locked --git https://github.com/roapi/roapi --branch main --bin roapi-http
 ```
 
 
@@ -50,20 +50,27 @@ cargo install --git https://github.com/roapi/roapi --branch main --bin roapi-htt
 ### Quick start
 
 Spin up APIs for `test_data/uk_cities_with_headers.csv` and
-`test_data/spacex-launches.json`:
+`test_data/spacex_launches.json`:
 
 ```bash
 roapi-http \
-    --table 'uk_cities:test_data/uk_cities_with_headers.csv' \
-    --table 'spacex_launches:test_data/spacex-launches.json'
+    --table "uk_cities=test_data/uk_cities_with_headers.csv" \
+    --table "test_data/spacex_launches.json"
+```
+
+For windows, full scheme(file:// or filesystem://) must filled, and use double quote(") instead of single quote(') to escape windows cmdline limit:
+```bash
+roapi-http \
+    --table "uk_cities=file://d:/path/to/uk_cities_with_headers.csv" \
+    --table "file://d:/path/to/test_data/spacex_launches.json"
 ```
 
 Or using docker:
 
 ```bash
 docker run -t --rm -p 8080:8080 ghcr.io/roapi/roapi-http:latest --addr 0.0.0.0:8080 \
-    --table 'uk_cities:test_data/uk_cities_with_headers.csv' \
-    --table 'spacex_launches:test_data/spacex-launches.json'
+    --table "uk_cities=test_data/uk_cities_with_headers.csv" \
+    --table "test_data/spacex_launches.json"
 ```
 
 Query tables using SQL, GraphQL or REST:
@@ -216,8 +223,8 @@ Query layer:
   - [x] REST API GET
   - [x] GraphQL
   - [x] SQL
-  - [ ] join between tables
-  - [ ] support filter on nested struct fields
+  - [x] join between tables
+  - [ ] support query on nested struct fields
   - [ ] index
   - protocol
     - [ ] gRPC
@@ -227,6 +234,7 @@ Query layer:
 Response serialization:
   - [x] JSON `application/json`
   - [x] Arrow `application/vnd.apache.arrow.stream`
+  - [x] Parquet `application/vnd.apache.parquet`
   - [ ] msgpack
 
 Data layer:
@@ -272,5 +280,3 @@ Building ROAPI with `simd` optimization requires nightly rust toolchain.
 ```bash
 docker build --rm -t ghcr.io/roapi/roapi-http:latest .
 ```
-
-You can set `RELEASE` variable to any git reference to build for a specific version.

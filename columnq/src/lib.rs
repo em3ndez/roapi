@@ -21,16 +21,24 @@ macro_rules! partitions_from_table_source {
             io::BlobStoreType::S3 => {
                 io::s3::partitions_from_uri(&$table_source, uri, $call_with_r).await
             }
+            io::BlobStoreType::Memory => {
+                io::memory::partitions_from_memory(&$table_source, $call_with_r).await
+            }
         }
     }};
 }
 
 pub mod columnq;
+pub mod encoding;
 pub mod io;
 pub mod query;
 pub mod table;
 
 pub use crate::columnq::*;
+
+/// export datafusion and arrow so downstream won't need to declare dependencies on these libraries
+pub use datafusion;
+pub use datafusion::arrow;
 
 #[cfg(test)]
 pub mod test_util;

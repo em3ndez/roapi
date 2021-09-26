@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
-use datafusion::logical_plan::{Expr, Operator};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::logical_plan::{Column, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 use regex::Regex;
 
@@ -27,10 +27,10 @@ fn rest_query_value_to_expr(v: &str) -> Result<Expr, QueryError> {
         sqlparser::tokenizer::Token::SingleQuotedString(s) => {
             Ok(Expr::Literal(ScalarValue::Utf8(Some(s.to_string()))))
         }
-        sqlparser::tokenizer::Token::Number(s) => {
-            if let Ok(n) = lexical_core::parse::<i64>(s.as_bytes()) {
+        sqlparser::tokenizer::Token::Number(s, _) => {
+            if let Ok(n) = s.parse() {
                 Ok(Expr::Literal(ScalarValue::Int64(Some(n))))
-            } else if let Ok(n) = lexical_core::parse::<f64>(s.as_bytes()) {
+            } else if let Ok(n) = s.parse() {
                 Ok(Expr::Literal(ScalarValue::Float64(Some(n))))
             } else {
                 Err(QueryError {
@@ -97,10 +97,12 @@ pub fn table_query_to_df(
             }
             // filter[col1]eq='foo'
             // filter[col2]lt=2
-            _ if key.starts_with("filter[") => match RE_REST_FILTER.captures(&key) {
+            _ if key.starts_with("filter[") => match RE_REST_FILTER.captures(key) {
                 Some(caps) => {
                     let col_expr: Box<Expr> = Box::new(match caps.name("column") {
-                        Some(column) => Expr::Column(column.as_str().to_string()),
+                        Some(column) => {
+                            Expr::Column(Column::from_name(column.as_str().to_string()))
+                        }
                         None => {
                             return Err(QueryError {
                                 error: "rest_query".to_string(),
@@ -113,33 +115,33 @@ pub fn table_query_to_df(
                         None => Expr::BinaryExpr {
                             left: col_expr,
                             op: Operator::Eq,
-                            right: Box::new(rest_query_value_to_expr(&val)?),
+                            right: Box::new(rest_query_value_to_expr(val)?),
                         },
                         Some(m) => match m.as_str() {
                             "eq" | "" => Expr::BinaryExpr {
                                 left: col_expr,
                                 op: Operator::Eq,
-                                right: Box::new(rest_query_value_to_expr(&val)?),
+                                right: Box::new(rest_query_value_to_expr(val)?),
                             },
                             "lt" => Expr::BinaryExpr {
                                 left: col_expr,
                                 op: Operator::Lt,
-                                right: Box::new(rest_query_value_to_expr(&val)?),
+                                right: Box::new(rest_query_value_to_expr(val)?),
                             },
                             "lte" | "lteq" => Expr::BinaryExpr {
                                 left: col_expr,
                                 op: Operator::LtEq,
-                                right: Box::new(rest_query_value_to_expr(&val)?),
+                                right: Box::new(rest_query_value_to_expr(val)?),
                             },
                             "gt" => Expr::BinaryExpr {
                                 left: col_expr,
                                 op: Operator::Gt,
-                                right: Box::new(rest_query_value_to_expr(&val)?),
+                                right: Box::new(rest_query_value_to_expr(val)?),
                             },
                             "gte" | "gteq" => Expr::BinaryExpr {
                                 left: col_expr,
                                 op: Operator::GtEq,
-                                right: Box::new(rest_query_value_to_expr(&val)?),
+                                right: Box::new(rest_query_value_to_expr(val)?),
                             },
                             _ => {
                                 return Err(QueryError {
@@ -181,7 +183,7 @@ pub async fn query_table(
 mod tests {
     use super::*;
 
-    use arrow::array::*;
+    use datafusion::arrow::array::*;
     use datafusion::execution::context::ExecutionContext;
 
     use crate::test_util::*;

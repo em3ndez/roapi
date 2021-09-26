@@ -6,27 +6,27 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  # NOTE: this env is also defined in roapi_http_release.yml and columnq_cli_release.yml
+  RUST_TC_NIGHTLY_VER: "2021-09-25"
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
-    # the whole target dir is over 400MB cache limit, so we have to split up
-    # the cache step to avoid caching deps dir
-    - name: Cache Rust build
-      uses: actions/cache@v1.0.1
+    - uses: actions/cache@v2
       with:
-        path: target/debug/build
-        key: ${{ runner.OS }}-target-build-${{ hashFiles('**/Cargo.lock') }}
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
         restore-keys: |
-          ${{ runner.OS }}-target-build-
-    - name: Cache Rust incremental build
-      uses: actions/cache@v1.0.1
-      with:
-        path: target/debug/incremental
-        key: ${{ runner.OS }}-target-incremental-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.OS }}-target-incremental-
+          ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          ${{ runner.os }}-cargo-
     - name: Install minimal stable with clippy and rustfmt
       uses: actions-rs/toolchain@v1
       with:
@@ -39,17 +39,49 @@ jobs:
       run: cargo build
     - name: Run tests
       run: cargo test
+    - name: Trim cache
+      run: |
+        cargo install --force cargo-cache
+        cargo cache trim -l 1G
 
   simd_test:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
+    - uses: actions/cache@v2
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: simd-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+        restore-keys: |
+          simd-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          simd-${{ runner.os }}-cargo-
     - name: Install nightly rust
       uses: actions-rs/toolchain@v1
       with:
         profile: default
-        toolchain: nightly
-        # toolchain: nightly-2021-03-23
+        # toolchain: nightly
+        toolchain: nightly-${{ env.RUST_TC_NIGHTLY_VER }}
         override: true
     - name: Run tests
       run: cargo test --features simd
+    - name: Trim cache
+      run: |
+        cargo install --force cargo-cache
+        cargo cache trim -l 1G
+
+  docker_build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Build Docker image
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        with:
+          context: .
+          push: false
+          tags: latest

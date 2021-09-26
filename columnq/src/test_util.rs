@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::*;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use datafusion::arrow::array::*;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::ExecutionContext;
@@ -89,7 +89,7 @@ fn properties_table() -> anyhow::Result<MemTable> {
     Ok(MemTable::try_new(schema, vec![vec![record_batch]])?)
 }
 
-async fn ubuntu_ami_table() -> anyhow::Result<MemTable> {
+async fn ubuntu_ami_table() -> anyhow::Result<Arc<dyn datafusion::datasource::TableProvider>> {
     let mut table_source: table::TableSource = serde_yaml::from_str(
         r#"
 name: "ubuntu_ami"
@@ -119,7 +119,8 @@ schema:
 "#,
     )?;
 
-    table_source.uri = test_data_path("ubuntu-ami.json");
+    // patch uri path with the correct test data path
+    table_source.io_source = table::TableIoSource::Uri(test_data_path("ubuntu-ami.json"));
 
     Ok(table::load(&table_source).await?)
 }
@@ -130,7 +131,7 @@ pub fn register_table_properties(dfctx: &mut ExecutionContext) -> anyhow::Result
 }
 
 pub async fn register_table_ubuntu_ami(dfctx: &mut ExecutionContext) -> anyhow::Result<()> {
-    dfctx.register_table("ubuntu_ami", Arc::new(ubuntu_ami_table().await?))?;
+    dfctx.register_table("ubuntu_ami", ubuntu_ami_table().await?)?;
     Ok(())
 }
 

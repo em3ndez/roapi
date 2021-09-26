@@ -1,11 +1,12 @@
 use std::convert::TryFrom;
 
 use actix_web::{http, HttpRequest, HttpResponse};
+use columnq::datafusion::arrow;
+use columnq::encoding;
 use columnq::ColumnQ;
 use log::info;
 
 use crate::config::Config;
-use crate::encoding;
 use crate::error::ApiErrResp;
 
 pub struct HandlerContext {
@@ -22,9 +23,9 @@ impl HandlerContext {
         }
 
         for t in config.tables.iter() {
-            info!("loading `{}` as table `{}`", t.uri, t.name);
+            info!("loading `{}` as table `{}`", t.io_source, t.name);
             cq.load_table(t).await?;
-            info!("registered `{}` as table `{}`", t.uri, t.name);
+            info!("registered `{}` as table `{}`", t.io_source, t.name);
         }
 
         Ok(Self { cq })
@@ -57,9 +58,24 @@ pub fn encode_record_batches(
                 .map_err(ApiErrResp::json_serialization)?;
             Ok(builder.body(payload))
         }
+        encoding::ContentType::Csv => {
+            let payload = encoding::csv::record_batches_to_bytes(batches)
+                .map_err(ApiErrResp::csv_serialization)?;
+            Ok(builder.body(payload))
+        }
+        encoding::ContentType::ArrowFile => {
+            let payload = encoding::arrow::record_batches_to_file_bytes(batches)
+                .map_err(ApiErrResp::arrow_file_serialization)?;
+            Ok(builder.body(payload))
+        }
         encoding::ContentType::ArrowStream => {
             let payload = encoding::arrow::record_batches_to_stream_bytes(batches)
                 .map_err(ApiErrResp::arrow_stream_serialization)?;
+            Ok(builder.body(payload))
+        }
+        encoding::ContentType::Parquet => {
+            let payload = encoding::parquet::record_batches_to_bytes(batches)
+                .map_err(ApiErrResp::parquet_serialization)?;
             Ok(builder.body(payload))
         }
     }

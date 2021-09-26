@@ -1,7 +1,9 @@
 [package]
 name = "roapi-http"
-version = "0.2.0"
-authors = ["Qingping Hou <dave2008713@gmail.com>"]
+version = "0.4.1"
+authors = ["QP Hou <dave2008713@gmail.com>"]
+homepage = "https://github.com/roapi/roapi"
+license = "MIT"
 edition = "2018"
 
 [lib]
@@ -13,13 +15,12 @@ name = "roapi-http"
 path = "src/main.rs"
 
 [dependencies]
-columnq = { path = "../columnq" }
-arrow  = "4.3.0"
+columnq = { path = "../columnq", version = "0" }
 
 # all actix dependencies are patched to use git source until actix-web 4.x lands
-actix-web = "4.0.0-beta"
-actix-http = "3.0.0-beta"
-actix-service = "2.0.0-beta"
+actix-web = "4.0.0-beta.4"
+actix-http = "3.0.0-beta.4"
+actix-service = "2.0.0-beta.3"
 # see https://github.com/actix/actix-extras/pull/144 for cors tokio 1 upgrade
 actix-cors = "*"
 
@@ -38,4 +39,3 @@ simd = ["columnq/simd"]
 
 [dev-dependencies]
 actix-rt = "*"
-pretty_assertions = "*"

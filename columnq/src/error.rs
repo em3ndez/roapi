@@ -1,6 +1,7 @@
 use std::fmt;
 
 use datafusion::error::DataFusionError;
+use datafusion::{arrow, parquet};
 use uriparse::uri_reference::URIReferenceError;
 
 #[derive(thiserror::Error, Debug)]
@@ -55,6 +56,9 @@ pub enum ColumnQError {
         #[from]
         source: datafusion::error::DataFusionError,
     },
+
+    #[error("Generic error: {0}")]
+    Generic(String),
 }
 
 impl ColumnQError {
