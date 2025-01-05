@@ -1,7 +1,6 @@
-use std::convert::TryFrom;
-use std::sync::Arc;
-
-use datafusion::logical_plan::{Expr, Operator};
+use datafusion::arrow;
+use datafusion::logical_expr::{expr::Sort, Operator};
+use datafusion::prelude::{binary_expr, Column, Expr};
 use datafusion::scalar::ScalarValue;
 use graphql_parser::query::{parse_query, Definition, OperationDefinition, Selection, Value};
 
@@ -24,10 +23,7 @@ impl From<graphql_parser::query::ParseError> for QueryError {
 fn invalid_selection_set(error: datafusion::error::DataFusionError) -> QueryError {
     QueryError {
         error: "invalid_selection_set".to_string(),
-        message: format!(
-            "failed to apply selection set for query: {}",
-            error.to_string()
-        ),
+        message: format!("failed to apply selection set for query: {error}"),
     }
 }
 
@@ -41,9 +37,7 @@ fn invalid_query(message: String) -> QueryError {
 // convert order list from graphql argument to datafusion sort columns
 //
 // sort order matters, thus it's modeled as a list
-fn to_datafusion_sort_columns<'a, 'b>(
-    sort_columns: &'a [Value<'b, &'b str>],
-) -> Result<Vec<Expr>, QueryError> {
+fn to_datafusion_sort_columns(sort_columns: &[Value<String>]) -> Result<Vec<Sort>, QueryError> {
     sort_columns
         .iter()
         .map(|optval| match optval {
@@ -57,8 +51,7 @@ fn to_datafusion_sort_columns<'a, 'b>(
                     }
                     _ => {
                         return Err(invalid_query(format!(
-                            "field in sort option should be a string, got: {}",
-                            optval,
+                            "field in sort option should be a string, got: {optval}",
                         )));
                     }
                 };
@@ -69,25 +62,22 @@ fn to_datafusion_sort_columns<'a, 'b>(
                         "desc" => Ok(column_sort_expr_desc(col.to_string())),
                         "asc" => Ok(column_sort_expr_asc(col.to_string())),
                         other => Err(invalid_query(format!(
-                            "sort order needs to be either `desc` or `asc`, got: {}",
-                            other,
+                            "sort order needs to be either `desc` or `asc`, got: {other}",
                         ))),
                     },
                     Some(v) => Err(invalid_query(format!(
-                        "sort order value should to be a String, got: {}",
-                        v,
+                        "sort order value should to be a String, got: {v}",
                     ))),
                 }
             }
             other => Err(invalid_query(format!(
-                "sort condition should be defined as object, got: {}",
-                other,
+                "sort condition should be defined as object, got: {other}",
             ))),
         })
         .collect()
 }
 
-fn operand_to_datafusion_expr<'a, 'b>(operand: &'a Value<'b, &'b str>) -> Result<Expr, QueryError> {
+fn operand_to_datafusion_expr(operand: &Value<String>) -> Result<Expr, QueryError> {
     match operand {
         Value::Boolean(b) => Ok(Expr::Literal(ScalarValue::Boolean(Some(*b)))),
         Value::String(s) => Ok(Expr::Literal(ScalarValue::Utf8(Some(s.to_string())))),
@@ -97,15 +87,13 @@ fn operand_to_datafusion_expr<'a, 'b>(operand: &'a Value<'b, &'b str>) -> Result
         Value::Int(n) => Ok(Expr::Literal(ScalarValue::Int64(Some(
             n.as_i64().ok_or_else(|| {
                 invalid_query(format!(
-                    "invalid integer number in filter predicate: {}",
-                    operand
+                    "invalid integer number in filter predicate: {operand}"
                 ))
             })?,
         )))),
         Value::Float(f) => Ok(Expr::Literal(ScalarValue::Float64(Some(f.to_owned())))),
         other => Err(invalid_query(format!(
-            "invalid operand in filter predicate: {}",
-            other,
+            "invalid operand in filter predicate: {other}",
         ))),
     }
 }
@@ -124,69 +112,43 @@ fn operand_to_datafusion_expr<'a, 'b>(operand: &'a Value<'b, &'b str>) -> Result
 //     col4
 // }
 // ```
-fn to_datafusion_predicates<'a, 'b>(
-    col: &'b str,
-    filter: &'a Value<'b, &'b str>,
-) -> Result<Vec<Expr>, QueryError> {
+fn to_datafusion_predicates(col: &str, filter: &Value<String>) -> Result<Vec<Expr>, QueryError> {
     match filter {
         Value::Object(obj) => obj
             .iter()
             .map(|(op, operand)| {
-                let col_expr = Box::new(Expr::Column(col.to_string()));
-                let right_expr = Box::new(operand_to_datafusion_expr(operand)?);
-                match *op {
-                    "eq" => Ok(Expr::BinaryExpr {
-                        left: col_expr,
-                        op: Operator::Eq,
-                        right: right_expr,
-                    }),
-                    "lt" => Ok(Expr::BinaryExpr {
-                        left: col_expr,
-                        op: Operator::Lt,
-                        right: right_expr,
-                    }),
-                    "lte" | "lteq" => Ok(Expr::BinaryExpr {
-                        left: col_expr,
-                        op: Operator::LtEq,
-                        right: right_expr,
-                    }),
-                    "gt" => Ok(Expr::BinaryExpr {
-                        left: col_expr,
-                        op: Operator::Gt,
-                        right: right_expr,
-                    }),
-                    "gte" | "gteq" => Ok(Expr::BinaryExpr {
-                        left: col_expr,
-                        op: Operator::GtEq,
-                        right: right_expr,
-                    }),
+                let col_expr = Expr::Column(Column::from_name(col.to_string()));
+                let right_expr = operand_to_datafusion_expr(operand)?;
+                match op.as_str() {
+                    "eq" => Ok(binary_expr(col_expr, Operator::Eq, right_expr)),
+                    "lt" => Ok(binary_expr(col_expr, Operator::Lt, right_expr)),
+                    "lte" | "lteq" => Ok(binary_expr(col_expr, Operator::LtEq, right_expr)),
+                    "gt" => Ok(binary_expr(col_expr, Operator::Gt, right_expr)),
+                    "gte" | "gteq" => Ok(binary_expr(col_expr, Operator::GtEq, right_expr)),
                     other => Err(invalid_query(format!(
-                        "invalid filter predicate operator, got: {}",
-                        other,
+                        "invalid filter predicate operator, got: {other}",
                     ))),
                 }
             })
             .collect::<Result<Vec<Expr>, _>>(),
         // when filter is literal, default to equality comparison
         Value::Boolean(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => {
-            Ok(vec![Expr::BinaryExpr {
-                left: Box::new(Expr::Column(col.to_string())),
-                op: Operator::Eq,
-                right: Box::new(operand_to_datafusion_expr(filter)?),
-            }])
+            Ok(vec![binary_expr(
+                Expr::Column(Column::from_name(col.to_string())),
+                Operator::Eq,
+                operand_to_datafusion_expr(filter)?,
+            )])
         }
         other => Err(invalid_query(format!(
-            "filter predicate should be defined as object, got: {}",
-            other,
+            "filter predicate should be defined as object, got: {other}",
         ))),
     }
 }
 
-pub fn query_to_df(
-    dfctx: &datafusion::execution::context::ExecutionContext,
-    q: &str,
-) -> Result<Arc<dyn datafusion::dataframe::DataFrame>, QueryError> {
-    let doc = parse_query::<&str>(q)?;
+pub fn parse_query_to_field(
+    query: &str,
+) -> Result<graphql_parser::query::Field<'_, String>, QueryError> {
+    let doc = parse_query::<String>(query)?;
 
     let def = match doc.definitions.len() {
         1 => match &doc.definitions[0] {
@@ -208,7 +170,7 @@ pub fn query_to_df(
         n => {
             return Err(QueryError {
                 error: "invalid graphql query".to_string(),
-                message: format!("only 1 definition allowed, got: {}", n),
+                message: format!("only 1 definition allowed, got: {n}"),
             });
         }
     };
@@ -219,7 +181,7 @@ pub fn query_to_df(
         _ => {
             return Err(QueryError {
                 error: "invalid graphql query".to_string(),
-                message: format!("Unsupported operation: {}", def),
+                message: format!("Unsupported operation: {def}"),
             });
         }
     }
@@ -256,9 +218,52 @@ pub fn query_to_df(
 
     let field = field.ok_or_else(|| invalid_query("field not found in selection".to_string()))?;
 
-    let mut df = dfctx
-        .table(field.name)
-        .map_err(|e| QueryError::invalid_table(e, &field.name))?;
+    Ok(field.clone())
+}
+
+fn apply_field_to_df(
+    mut df: datafusion::dataframe::DataFrame,
+    field: graphql_parser::query::Field<'_, String>,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    let mut filter = None;
+    let mut sort = None;
+    let mut limit = None;
+    let mut page = None;
+    for (key, value) in &field.arguments {
+        match key.as_str() {
+            "filter" => {
+                filter = Some(value);
+            }
+            "sort" => {
+                sort = Some(value);
+            }
+            "limit" => {
+                limit = Some(value);
+            }
+            "page" => page = Some(value),
+            other => {
+                return Err(invalid_query(format!("invalid query argument: {other}")));
+            }
+        }
+    }
+
+    // apply filter
+    if let Some(value) = filter {
+        match value {
+            Value::Object(filters) => {
+                for (col, filter) in filters {
+                    for p in to_datafusion_predicates(col, filter)? {
+                        df = df.filter(p).map_err(QueryError::invalid_filter)?;
+                    }
+                }
+            }
+            other => {
+                return Err(invalid_query(format!(
+                    "filter argument takes object as value, got: {other}"
+                )));
+            }
+        }
+    }
 
     // apply projection
     let column_names = field
@@ -266,7 +271,7 @@ pub fn query_to_df(
         .items
         .iter()
         .map(|selection| match selection {
-            Selection::Field(f) => Ok(f.name),
+            Selection::Field(f) => Ok(f.name.as_str()),
             _ => Err(QueryError {
                 error: "invalid graphql query".to_string(),
                 message: "selection set in query should only contain Fields".to_string(),
@@ -277,59 +282,59 @@ pub fn query_to_df(
         .select_columns(&column_names)
         .map_err(invalid_selection_set)?;
 
-    for (key, value) in &field.arguments {
-        match *key {
-            "filter" => match value {
-                Value::Object(filters) => {
-                    for (col, filter) in filters {
-                        for p in to_datafusion_predicates(col, filter)? {
-                            df = df.filter(p).map_err(QueryError::invalid_filter)?;
+    // apply sort
+    if let Some(value) = sort {
+        match value {
+            Value::List(sort_options) => {
+                df = df
+                    .sort(to_datafusion_sort_columns(sort_options)?)
+                    .map_err(QueryError::invalid_sort)?;
+            }
+            other => {
+                return Err(invalid_query(format!(
+                    "sort argument takes list as value, got: {other}"
+                )));
+            }
+        }
+    }
+
+    // apply limit
+    // apply limit
+    if let Some(value) = limit {
+        match value {
+            Value::Int(n) => {
+                let skip = match page {
+                    None => 0,
+                    Some(value) => {
+                        if let Value::Int(n) = value {
+                            n.as_i64().ok_or_else(|| {
+                                invalid_query(format!(
+                                    "invalid 64bits integer number in limit argument: {value}",
+                                ))
+                            })? - 1
+                        } else {
+                            0
                         }
                     }
-                }
-                other => {
-                    return Err(invalid_query(format!(
-                        "filter argument takes object as value, got: {}",
-                        other
-                    )));
-                }
-            },
-            "sort" => match value {
-                Value::List(sort_options) => {
-                    df = df
-                        .sort(to_datafusion_sort_columns(sort_options)?)
-                        .map_err(QueryError::invalid_sort)?;
-                }
-                other => {
-                    return Err(invalid_query(format!(
-                        "sort argument takes list as value, got: {}",
-                        other
-                    )));
-                }
-            },
-            "limit" => match value {
-                Value::Int(n) => {
-                    let limit = n.as_i64().ok_or_else(|| {
-                        invalid_query(format!(
-                            "invalid 64bits integer number in limit argument: {}",
-                            value,
-                        ))
-                    })?;
-                    df = df
-                        .limit(usize::try_from(limit).map_err(|_| {
-                            invalid_query(format!("limit value too large: {}", value))
-                        })?)
-                        .map_err(QueryError::invalid_limit)?;
-                }
-                other => {
-                    return Err(invalid_query(format!(
-                        "limit argument takes int as value, got: {}",
-                        other,
-                    )));
-                }
-            },
+                };
+                let limit = n.as_i64().ok_or_else(|| {
+                    invalid_query(format!(
+                        "invalid 64bits integer number in limit argument: {value}",
+                    ))
+                })?;
+                df = df
+                    .limit(
+                        (skip as usize) * limit as usize,
+                        Some(usize::try_from(limit).map_err(|_| {
+                            invalid_query(format!("limit value too large: {value}"))
+                        })?),
+                    )
+                    .map_err(QueryError::invalid_limit)?;
+            }
             other => {
-                return Err(invalid_query(format!("invalid query argument: {}", other)));
+                return Err(invalid_query(format!(
+                    "limit argument takes int as value, got: {other}",
+                )));
             }
         }
     }
@@ -337,11 +342,47 @@ pub fn query_to_df(
     Ok(df)
 }
 
+/// Applies a GraphQL query to the provided DataFrame.
+pub fn apply_query(
+    df: datafusion::dataframe::DataFrame,
+    query: &str,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    let field = parse_query_to_field(query)?;
+    apply_field_to_df(df, field)
+}
+
+/// GraphQL query to a DataFrame using the given SessionContext.
+pub async fn query_to_df(
+    dfctx: &datafusion::execution::context::SessionContext,
+    query: &str,
+) -> Result<datafusion::dataframe::DataFrame, QueryError> {
+    let field = parse_query_to_field(query)?;
+    let df = dfctx
+        .table(field.name.as_str())
+        .await
+        .map_err(|e| QueryError::invalid_table(e, field.name.as_str()))?;
+
+    apply_field_to_df(df, field)
+}
+
+/// Executes a GraphQL query using the provided SessionContext.
 pub async fn exec_query(
-    dfctx: &datafusion::execution::context::ExecutionContext,
+    dfctx: &datafusion::execution::context::SessionContext,
     q: &str,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, QueryError> {
-    query_to_df(dfctx, q)?
+    query_to_df(dfctx, q)
+        .await?
+        .collect()
+        .await
+        .map_err(QueryError::query_exec)
+}
+
+/// Executes a GraphQL query using the provided DataFrame.
+pub async fn exec_query_with_df(
+    df: datafusion::dataframe::DataFrame,
+    query: &str,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, QueryError> {
+    apply_query(df.clone(), query)?
         .collect()
         .await
         .map_err(QueryError::query_exec)
@@ -349,20 +390,67 @@ pub async fn exec_query(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::*;
-    use datafusion::execution::context::ExecutionContext;
-    use datafusion::logical_plan::{col, lit};
+    use datafusion::arrow::array::*;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::{col, ident, lit};
 
     use super::*;
     use crate::test_util::*;
 
-    #[test]
-    fn simple_query_planning() -> anyhow::Result<()> {
-        let mut dfctx = ExecutionContext::new();
-        register_table_properties(&mut dfctx)?;
+    #[tokio::test]
+    async fn simple_query_planning() {
+        let mut dfctx = SessionContext::new();
+        register_table_properties(&mut dfctx);
 
         let df = query_to_df(
             &dfctx,
+            r#"{
+                properties(
+                    filter: {
+                        bed: { gt: 3 }
+                        bath: { gteq: 2 }
+                    }
+                ) {
+                    address
+                    bed
+                    bath
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let expected_df = dfctx
+            .table("properties")
+            .await
+            .unwrap()
+            .filter(col("bath").gt_eq(lit(2i64)))
+            .unwrap()
+            .filter(col("bed").gt(lit(3i64)))
+            .unwrap()
+            .select(vec![col("address"), col("bed"), col("bath")])
+            .unwrap();
+
+        assert_eq_df(df.into(), expected_df.into());
+    }
+
+    #[tokio::test]
+    async fn simple_query_planning_with_column_aliases() {
+        let mut dfctx = SessionContext::new();
+        register_table_properties(&mut dfctx);
+        let modified_df = dfctx
+            .table("properties")
+            .await
+            .unwrap()
+            .select(vec![
+                col("address").alias("Address"),
+                col("bed").alias("Bed"),
+                col("bath").alias("Bath"),
+            ])
+            .unwrap();
+
+        let df = apply_query(
+            modified_df.clone(),
             r#"{
                 properties(
                     filter: {
@@ -370,63 +458,96 @@ mod tests {
                         Bath: { gteq: 2 }
                     }
                 ) {
-                    Address
+                    Address 
                     Bed
-                    Bath
+                    Bath 
                 }
             }"#,
-        )?;
+        )
+        .unwrap();
 
-        let expected_df = dfctx
-            .table("properties")?
-            .select(vec![col("Address"), col("Bed"), col("Bath")])?
-            .filter(col("Bath").gt_eq(lit(2i64)))?
-            .filter(col("Bed").gt(lit(3i64)))?;
+        let expected_df = modified_df
+            .filter(ident("Bath").gt_eq(lit(2i64)))
+            .unwrap()
+            .filter(ident("Bed").gt(lit(3i64)))
+            .unwrap();
 
-        assert_eq_df(df, expected_df);
-
-        Ok(())
+        assert_eq_df(df.into(), expected_df.into());
     }
 
     #[tokio::test]
-    async fn boolean_literal_as_predicate_operand() -> anyhow::Result<()> {
-        let mut dfctx = ExecutionContext::new();
-        register_table_properties(&mut dfctx)?;
+    async fn consistent_and_deterministics_logical_plan() {
+        let mut dfctx = SessionContext::new();
+        register_table_properties(&mut dfctx);
+
+        let df = query_to_df(
+            &dfctx,
+            r#"{
+                properties(
+                    filter: {
+                        bed: { gt: 3 }
+                    }
+                    limit: 10
+                    sort: [
+                        { field: "bed" }
+                    ]
+                ) {
+                    address
+                    bed
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let expected_df = dfctx
+            .table("properties")
+            .await
+            .unwrap()
+            .filter(col("bed").gt(lit(3i64)))
+            .unwrap()
+            .select(vec![col("address"), col("bed")])
+            .unwrap()
+            .sort(vec![column_sort_expr_asc("bed")])
+            .unwrap()
+            .limit(0, Some(10))
+            .unwrap();
+
+        assert_eq_df(df.into(), expected_df.into());
+    }
+
+    #[tokio::test]
+    async fn boolean_literal_as_predicate_operand() {
+        let mut dfctx = SessionContext::new();
+        register_table_properties(&mut dfctx);
 
         let batches = exec_query(
             &dfctx,
             r#"{
                 properties(
                     filter: {
-                        Occupied: false
-                        Bed: { gteq: 4 }
+                        occupied: false
+                        bed: { gteq: 4 }
                     }
                 ) {
-                    Address
-                    Bed
-                    Bath
+                    address
+                    bed
+                    bath
                 }
             }"#,
         )
-        .await?;
+        .await
+        .unwrap();
 
         let batch = &batches[0];
 
         assert_eq!(
             batch.column(0).as_ref(),
-            Arc::new(StringArray::from(vec!["Kenmore, WA", "Fremont, WA",])).as_ref(),
+            &StringArray::from(vec!["Kenmore, WA", "Fremont, WA",]),
         );
 
-        assert_eq!(
-            batch.column(1).as_ref(),
-            Arc::new(Int64Array::from(vec![4, 5])).as_ref(),
-        );
+        assert_eq!(batch.column(1).as_ref(), &Int64Array::from(vec![4, 5]),);
 
-        assert_eq!(
-            batch.column(2).as_ref(),
-            Arc::new(Int64Array::from(vec![3, 3])).as_ref(),
-        );
-
-        Ok(())
+        assert_eq!(batch.column(2).as_ref(), &Int64Array::from(vec![3, 3]),);
     }
 }

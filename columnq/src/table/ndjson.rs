@@ -1,49 +1,217 @@
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::json::reader::{infer_json_schema, Decoder, ValueIter};
-use arrow::record_batch::RecordBatch;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
+#[allow(deprecated)]
+use datafusion::arrow::json::reader::{infer_json_schema, ReaderBuilder};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::TableProvider;
+use snafu::prelude::*;
 
-use crate::error::ColumnQError;
-use crate::table::TableSource;
+use crate::table::{self, LoadedTable, TableSource};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to infer NDJSON schema: {source}"))]
+    InferSchema {
+        source: datafusion::arrow::error::ArrowError,
+    },
+    #[snafu(display("Found empty NDJSON schema"))]
+    EmptySchema {},
+    #[snafu(display("Failed to build arrow reader: {source}"))]
+    BuildReader {
+        source: datafusion::arrow::error::ArrowError,
+    },
+    #[snafu(display("Failed to collect arrow record batches: {source}"))]
+    CollectBatches {
+        source: datafusion::arrow::error::ArrowError,
+    },
+}
+
+fn json_schema_from_reader<R: Read>(r: R) -> Result<Schema, table::Error> {
+    let mut reader = BufReader::new(r);
+    let (schema, _) = infer_json_schema(&mut reader, None)
+        .context(InferSchemaSnafu)
+        .context(table::LoadNdJsonSnafu)?;
+    Ok(schema)
+}
+
+fn decode_json_from_reader<R: Read>(
+    r: R,
+    schema_ref: SchemaRef,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>, table::Error> {
+    let batch_reader = ReaderBuilder::new(schema_ref)
+        .with_batch_size(batch_size)
+        .build(BufReader::new(r))
+        .context(BuildReaderSnafu)
+        .context(table::LoadNdJsonSnafu)?;
+
+    let batches = batch_reader
+        .collect::<Result<Vec<RecordBatch>, _>>()
+        .context(CollectBatchesSnafu)
+        .context(table::LoadNdJsonSnafu)?;
+
+    Ok(batches)
+}
 
 pub async fn to_mem_table(
     t: &TableSource,
-) -> Result<datafusion::datasource::MemTable, ColumnQError> {
-    // TODO: make batch size configurable
-    let batch_size = 1024;
+    dfctx: &datafusion::execution::context::SessionContext,
+) -> Result<datafusion::datasource::MemTable, table::Error> {
+    let batch_size = t.batch_size;
 
     let schema_ref: SchemaRef = match &t.schema {
         Some(table_schema) => Arc::new(table_schema.into()),
         // infer schema from data if not provided by user
         None => {
             let inferred_schema: Vec<Schema> =
-                partitions_from_table_source!(t, |reader| -> Result<Schema, ColumnQError> {
-                    let mut reader = BufReader::new(reader);
-                    Ok(infer_json_schema(&mut reader, None)?)
-                })?;
+                partitions_from_table_source!(t, json_schema_from_reader, dfctx)
+                    .context(table::IoSnafu)?;
             if inferred_schema.is_empty() {
-                return Err(ColumnQError::LoadJson("failed to load schema".to_string()));
+                return Err(Error::EmptySchema {}).context(table::LoadNdJsonSnafu);
             }
-            Arc::new(Schema::try_merge(inferred_schema)?)
+            Arc::new(
+                Schema::try_merge(inferred_schema)
+                    .context(InferSchemaSnafu)
+                    .context(table::LoadNdJsonSnafu)?,
+            )
         }
     };
 
-    let decoder = Decoder::new(schema_ref.clone(), batch_size, None);
+    let partitions: Vec<Vec<RecordBatch>> = partitions_from_table_source!(
+        t,
+        |reader| decode_json_from_reader(reader, schema_ref.clone(), batch_size),
+        dfctx
+    )
+    .context(table::IoSnafu)?;
 
-    let partitions: Vec<Vec<RecordBatch>> =
-        partitions_from_table_source!(t, |reader| -> Result<Vec<RecordBatch>, ColumnQError> {
-            let mut reader = BufReader::new(reader);
-            let mut value_reader = ValueIter::new(&mut reader, None);
-            let mut batches = vec![];
-            while let Some(batch) = decoder.next_batch(&mut value_reader)? {
-                batches.push(batch);
-            }
-            Ok(batches)
-        })?;
+    datafusion::datasource::MemTable::try_new(schema_ref, partitions)
+        .context(table::CreateMemTableSnafu)
+}
 
-    Ok(datafusion::datasource::MemTable::try_new(
-        schema_ref, partitions,
-    )?)
+async fn to_datafusion_table(
+    t: TableSource,
+    dfctx: datafusion::execution::context::SessionContext,
+) -> Result<Arc<dyn TableProvider>, table::Error> {
+    Ok(Arc::new(to_mem_table(&t, &dfctx).await?))
+}
+
+pub async fn to_loaded_table(
+    t: TableSource,
+    dfctx: datafusion::execution::context::SessionContext,
+) -> Result<LoadedTable, table::Error> {
+    LoadedTable::new_from_df_table_cb(move || to_datafusion_table(t.clone(), dfctx.clone())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::{datasource::TableProvider, prelude::SessionContext};
+
+    use super::*;
+    use crate::test_util::test_data_path;
+
+    #[tokio::test]
+    async fn load_simple_ndjson_file() {
+        let ctx = SessionContext::new();
+        let t = to_mem_table(
+            &TableSource::new(
+                "spacex_launches".to_string(),
+                test_data_path("spacex_launches.ndjson"),
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let schema = t.schema();
+        let fields = schema.fields();
+
+        let mut obj_keys = fields.iter().map(|f| f.name()).collect::<Vec<_>>();
+        obj_keys.sort();
+        let mut expected_obj_keys = vec![
+            "fairings",
+            "links",
+            "static_fire_date_utc",
+            "static_fire_date_unix",
+            "tbd",
+            "net",
+            "window",
+            "rocket",
+            "success",
+            "details",
+            "crew",
+            "ships",
+            "capsules",
+            "payloads",
+            "launchpad",
+            "auto_update",
+            "failures",
+            "flight_number",
+            "name",
+            "date_unix",
+            "date_utc",
+            "date_local",
+            "date_precision",
+            "upcoming",
+            "cores",
+            "id",
+            "launch_library_id",
+        ];
+        expected_obj_keys.sort();
+
+        assert_eq!(obj_keys, expected_obj_keys);
+    }
+
+    #[tokio::test]
+    async fn load_simple_jsonl_file() {
+        let ctx = SessionContext::new();
+        let t = to_mem_table(
+            &TableSource::new(
+                "spacex_launches".to_string(),
+                test_data_path("spacex_launches.jsonl"),
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let schema = t.schema();
+        let fields = schema.fields();
+
+        let mut obj_keys = fields.iter().map(|f| f.name()).collect::<Vec<_>>();
+        obj_keys.sort();
+        let mut expected_obj_keys = vec![
+            "fairings",
+            "links",
+            "static_fire_date_utc",
+            "static_fire_date_unix",
+            "tbd",
+            "net",
+            "window",
+            "rocket",
+            "success",
+            "details",
+            "crew",
+            "ships",
+            "capsules",
+            "payloads",
+            "launchpad",
+            "auto_update",
+            "failures",
+            "flight_number",
+            "name",
+            "date_unix",
+            "date_utc",
+            "date_local",
+            "date_precision",
+            "upcoming",
+            "cores",
+            "id",
+            "launch_library_id",
+        ];
+        expected_obj_keys.sort();
+
+        assert_eq!(obj_keys, expected_obj_keys);
+    }
 }

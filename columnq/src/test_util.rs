@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::*;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use datafusion::arrow::array::*;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
-use datafusion::execution::context::ExecutionContext;
+use datafusion::execution::context::SessionContext;
+use snafu::{whatever, Whatever};
 
 use crate::table;
 
@@ -17,15 +17,15 @@ pub fn test_data_path(relative_path: &str) -> String {
     d.to_string_lossy().to_string()
 }
 
-fn properties_table() -> anyhow::Result<MemTable> {
+fn properties_table() -> Result<MemTable, Whatever> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("Address", DataType::Utf8, false),
-        Field::new("Landlord", DataType::Utf8, false),
-        Field::new("Bed", DataType::Int64, false),
-        Field::new("Bath", DataType::Int64, false),
-        Field::new("Occupied", DataType::Boolean, false),
-        Field::new("Monthly_Rent", DataType::Utf8, false),
-        Field::new("Lease_Expiration_Date", DataType::Utf8, false),
+        Field::new("address", DataType::Utf8, false),
+        Field::new("landlord", DataType::Utf8, false),
+        Field::new("bed", DataType::Int64, false),
+        Field::new("bath", DataType::Int64, false),
+        Field::new("occupied", DataType::Boolean, false),
+        Field::new("monthly_rent", DataType::Utf8, false),
+        Field::new("lease_expiration_date", DataType::Utf8, false),
     ]));
 
     let record_batch = RecordBatch::try_new(
@@ -84,13 +84,15 @@ fn properties_table() -> anyhow::Result<MemTable> {
                 "8/4/2021",
             ])),
         ],
-    )?;
+    );
+    let record_batch = whatever!(record_batch, "failed to create record batch");
 
-    Ok(MemTable::try_new(schema, vec![vec![record_batch]])?)
+    let t = MemTable::try_new(schema, vec![vec![record_batch]]);
+    Ok(whatever!(t, "failed to create mem table"))
 }
 
-async fn ubuntu_ami_table() -> anyhow::Result<MemTable> {
-    let mut table_source: table::TableSource = serde_yaml::from_str(
+async fn ubuntu_ami_table() -> Result<Arc<dyn datafusion::datasource::TableProvider>, Whatever> {
+    let table_source = serde_yaml::from_str(
         r#"
 name: "ubuntu_ami"
 uri: "test_data/ubuntu-ami.json"
@@ -117,26 +119,31 @@ schema:
     - name: "aki_id"
       data_type: "Utf8"
 "#,
-    )?;
+    );
+    let mut table_source: table::TableSource =
+        whatever!(table_source, "failed to load table source");
 
-    table_source.uri = test_data_path("ubuntu-ami.json");
-
-    Ok(table::load(&table_source).await?)
+    // patch uri path with the correct test data path
+    table_source.io_source = table::TableIoSource::Uri(test_data_path("ubuntu-ami.json"));
+    let ctx = SessionContext::new();
+    let t = table::load(&table_source, &ctx).await.unwrap();
+    Ok(t.table)
 }
 
-pub fn register_table_properties(dfctx: &mut ExecutionContext) -> anyhow::Result<()> {
-    dfctx.register_table("properties", Arc::new(properties_table()?))?;
-    Ok(())
+pub fn register_table_properties(dfctx: &mut SessionContext) {
+    let t = properties_table().unwrap();
+    dfctx.register_table("properties", Arc::new(t)).unwrap();
 }
 
-pub async fn register_table_ubuntu_ami(dfctx: &mut ExecutionContext) -> anyhow::Result<()> {
-    dfctx.register_table("ubuntu_ami", Arc::new(ubuntu_ami_table().await?))?;
-    Ok(())
+pub async fn register_table_ubuntu_ami(dfctx: &mut SessionContext) {
+    dfctx
+        .register_table("ubuntu_ami", ubuntu_ami_table().await.unwrap())
+        .unwrap();
 }
 
-pub fn assert_eq_df(df1: Arc<dyn DataFrame>, df2: Arc<dyn DataFrame>) {
+pub fn assert_eq_df(df1: Arc<DataFrame>, df2: Arc<DataFrame>) {
     assert_eq!(
-        format!("{:?}", df1.to_logical_plan()),
-        format!("{:?}", df2.to_logical_plan())
+        format!("{:?}", (*df1).clone().into_optimized_plan()),
+        format!("{:?}", (*df2).clone().into_optimized_plan())
     );
 }
