@@ -1,60 +1,102 @@
 [package]
 name = "columnq"
-version = "0.2.0"
-authors = ["Qingping Hou <dave2008713@gmail.com>"]
-edition = "2018"
+version = "0.9.4"
+homepage = "https://github.com/roapi/roapi"
+license = "MIT"
+authors = ["QP Hou <dave2008713@gmail.com>"]
+edition = "2021"
 
 [lib]
 name = "columnq"
 path = "src/lib.rs"
 
-[[bin]]
-name = "columnq"
-path = "src/bin/main.rs"
-
 [dependencies]
-arrow  = "4.3.0"
-parquet  = "4.3.0"
-datafusion  = "4"
-
-log = "0"
+url = "2.5"
+log = "0.4"
 regex = "1"
-lexical-core = "0.7"
-lazy_static = "1"
-graphql-parser = "0"
-sqlparser = "0.7"
-yup-oauth2 = "5"
 thiserror = "1"
-serde_json = "1"
+snafu = "0.8"
+serde_json = { version = "1" }
 serde_derive = "1"
 serde = "1"
 uriparse = "0"
 bytes = { version = "1" }
-reqwest = { version = "0.11", features = ["blocking", "json"] }
+percent-encoding = "2.3"
 
-tokio = "1"
+# datafusion
+datafusion = { version = "43", features = ["serde"] }
+
+# spreadsheets reader
+calamine = { version = "0.23.1", features = ["dates"] }
+
+# graphql
+graphql-parser = "0.4"
+
+# async
+tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 
-# S3
-rusoto_core = { version = "0.46" }
-rusoto_s3 = { version = "0.46" }
-rusoto_credential = { version = "0.46" }
-rusoto_sts = { version = "0.46" }
+# net
+reqwest = { version = "0", default-features = false, features = [
+    "blocking",
+    "json",
+] }
+hyper-tls = { version = "0", default-features = false, optional = true }
+hyper-rustls = { version = "0", default-features = false, optional = true }
 
-deltalake = { version = "0", features = ["s3"] }
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+tokio-postgres = { version = "0.7.12", optional = true }
+deltalake = { version = "0.22", features = [
+    "datafusion",
+    "datafusion-ext",
+    "s3",
+    "gcs",
+    "azure",
+] }
+yup-oauth2 = { version = "10", default-features = false, features = [
+    "service_account",
+] }
 
-# columnq cli
-rustyline = { version = "8", optional = true }
-env_logger = { version = "0", optional = true }
-anyhow = { version = "1", optional = true }
-clap = { version = ">=3.0.0-beta.2,<4", features = ["color"], optional = true }
+[dependencies.connectorx]
+git = "https://github.com/roapi/connector-x.git"
+rev = "0134b4852521d636250409823d21fb4a79a7d346"
+version = "0.3.3-alpha.1"
+features = ["default", "dst_arrow"]
+optional = true
 
 [dev-dependencies]
-anyhow = "1"
-serde_yaml = "0.8"
-tempdir = "0"
+serde_yaml = "0.9"
+toml = "0.7"
+tempfile = "3.3.0"
+pretty_assertions = "*"
+dotenvy = "*"
+rusqlite = "0"
 
 [features]
-default = ["cli"]
-simd = ["arrow/simd", "datafusion/simd"]
-cli = ["rustyline", "env_logger", "anyhow", "clap"]
+default = ["rustls"]
+rustls = [
+    "hyper-rustls",
+    "reqwest/rustls-tls",
+    "deltalake/s3",
+    "deltalake/azure",
+    "yup-oauth2/hyper-rustls",
+    "hyper-tls?/vendored",
+]
+native-tls-vendored = [
+    "reqwest/native-tls-vendored",
+    "hyper-tls?/vendored",
+    "deltalake/s3",
+    "deltalake/azure",
+    "yup-oauth2/hyper-tls",
+]
+native-tls = [
+    "reqwest/native-tls",
+    "hyper-tls",
+    "deltalake/s3",
+    "deltalake/azure",
+    "yup-oauth2/hyper-tls",
+]
+database-sqlite = ["connectorx/src_sqlite"]
+database-mysql = ["connectorx/src_mysql"]
+database-postgres = ["connectorx/src_postgres", "dep:tokio-postgres"]
+database = ["database-sqlite", "database-mysql", "database-postgres"]

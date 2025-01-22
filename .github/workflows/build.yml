@@ -6,50 +6,197 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  # NOTE: the version is also defined in roapi_release.yml and Dockerfile
+  RUST_TC_VER: "1.84.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=skylake"
     steps:
-    - uses: actions/checkout@v2
-    # the whole target dir is over 400MB cache limit, so we have to split up
-    # the cache step to avoid caching deps dir
-    - name: Cache Rust build
-      uses: actions/cache@v1.0.1
-      with:
-        path: target/debug/build
-        key: ${{ runner.OS }}-target-build-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.OS }}-target-build-
-    - name: Cache Rust incremental build
-      uses: actions/cache@v1.0.1
-      with:
-        path: target/debug/incremental
-        key: ${{ runner.OS }}-target-incremental-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.OS }}-target-incremental-
+    - uses: actions/checkout@v4
+    - uses: rui314/setup-mold@v1
     - name: Install minimal stable with clippy and rustfmt
-      uses: actions-rs/toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        profile: default
         toolchain: stable
         override: true
     - name: Check
-      run: cargo clippy
+      run: cargo clippy --features database
+    - name: Format
+      run: cargo fmt --check
     - name: Build
-      run: cargo build
+      run: mold -run cargo build
     - name: Run tests
-      run: cargo test
+      run: mold -run cargo test
 
-  simd_test:
+  database_test:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=skylake"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: rui314/setup-mold@v1
+    - name: Install rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ env.RUST_TC_VER }}
+        components: clippy
+        override: true
+    - name: Check
+      run: cargo clippy --features database
+    - name: Build
+      run: mold -run cargo build --features database
+    - name: Run tests
+      run: mold -run cargo test --features database
+
+  object_store_memory_test:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=skylake"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: rui314/setup-mold@v1
+    - name: Install rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ env.RUST_TC_VER }}
+        override: true
+    - name: Setup minio server (S3)
+      run: |
+        bash ci/scripts/setup_minio.sh
+        bash ci/scripts/populate_minio.sh
+    - name: Setup fake gcs server (GCS)
+      run: |
+        bash ci/scripts/setup_gcs.sh
+        bash ci/scripts/populate_gcs.sh
+    - name: Setup Azure storage server (Azure)
+      run: |
+        bash ci/scripts/setup_azure.sh
+        bash ci/scripts/populate_azure.sh
+    - name: Start roapi and Query
+      env:
+        AWS_DEFAULT_REGION: "us-east-1"
+        AWS_ACCESS_KEY_ID: minioadmin
+        AWS_SECRET_ACCESS_KEY: minioadmin
+        AWS_ENDPOINT_URL: "http://127.0.0.1:9000"
+        GOOGLE_SERVICE_ACCOUNT: "/tmp/gcs.json"
+        AZURITE_BLOB_STORAGE_URL: "http://127.0.0.1:10000"
+        AZURE_STORAGE_USE_EMULATOR: "true"
+        AZURE_ALLOW_HTTP: "true"
+        # https://docs.microsoft.com/en-us/azure/storage/common/storage-use-azurite?tabs=visual-studio#http-connection-strings
+        AZURE_STORAGE_ACCOUNT_NAME: "devstoreaccount1"
+        AZURE_STORAGE_ACCOUNT_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+      uses: BerniWittmann/background-server-action@v1.0.4
+      with:
+        command: /home/runner/work/roapi/roapi/test_end_to_end/query_blogs.sh
+        build: mold -run cargo build
+        start: mold -run cargo run --bin roapi -- -c test_end_to_end/test_object_store_memory.yml
+        wait-on: "http://127.0.0.1:8000/health"
+        # By default, wait-on will retry for 60 seconds. You can pass a custom timeout in seconds using wait-on-timeout.
+        # 10 minutes = 600 seconds
+        wait-on-timeout: 600
+
+  object_store_direct_test:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=skylake"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: rui314/setup-mold@v1
+    - name: Install rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ env.RUST_TC_VER }}
+        override: true
+    - name: Setup minio server (S3)
+      run: |
+        bash ci/scripts/setup_minio.sh
+        bash ci/scripts/populate_minio.sh
+    - name: Setup fake gcs server (GCS)
+      run: |
+        bash ci/scripts/setup_gcs.sh
+        bash ci/scripts/populate_gcs.sh
+    - name: Setup Azure storage server (Azure)
+      run: |
+        bash ci/scripts/setup_azure.sh
+        bash ci/scripts/populate_azure.sh
+    - name: Start roapi and Query
+      env:
+        AWS_DEFAULT_REGION: "us-east-1"
+        AWS_ACCESS_KEY_ID: minioadmin
+        AWS_SECRET_ACCESS_KEY: minioadmin
+        AWS_ENDPOINT_URL: http://127.0.0.1:9000
+        GOOGLE_SERVICE_ACCOUNT: "/tmp/gcs.json"
+        AZURITE_BLOB_STORAGE_URL: "http://127.0.0.1:10000"
+        AZURE_STORAGE_USE_EMULATOR: "true"
+        AZURE_ALLOW_HTTP: "true"
+        # https://docs.microsoft.com/en-us/azure/storage/common/storage-use-azurite?tabs=visual-studio#http-connection-strings
+        AZURE_STORAGE_ACCOUNT_NAME: "devstoreaccount1"
+        AZURE_STORAGE_ACCOUNT_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+        DIRECT_TABLE: "true"
+      uses: BerniWittmann/background-server-action@v1.0.4
+      with:
+        command: /home/runner/work/roapi/roapi/test_end_to_end/query_blogs.sh
+        build: mold -run cargo build
+        start: mold -run cargo run --bin roapi -- -c test_end_to_end/test_object_store_direct.yml
+        wait-on: "http://127.0.0.1:8000/health"
+        # By default, wait-on will retry for 60 seconds. You can pass a custom timeout in seconds using wait-on-timeout.
+        # 10 minutes = 600 seconds
+        wait-on-timeout: 600
+
+  # make sure native-tls always builds
+  openssl_build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - name: Install nightly rust
-      uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@v4
+    - name: Install minimal stable with clippy and rustfmt
+      uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        profile: default
-        toolchain: nightly
-        # toolchain: nightly-2021-03-23
+        toolchain: stable
         override: true
-    - name: Run tests
-      run: cargo test --features simd
+    - name: Check
+      run: cargo clippy --no-default-features --features=native-tls
+
+  # cross compile from x86 mac to arm64, this is to make sure universal2
+  # release will build without error
+  mac_cross_build:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ env.RUST_TC_VER }}
+        target: aarch64-apple-darwin
+    - name: Build binary - universal2
+      env:
+        DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+        MACOSX_DEPLOYMENT_TARGET: '10.9'
+      run: |
+        # set SDKROOT for C dependencies
+        export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+        cd roapi && \
+          cargo build --bin roapi --features database-sqlite,database-mysql  --target aarch64-apple-darwin
+
+  docker_build:
+    name: Docker Image Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build Docker image
+        uses: docker/build-push-action@4a13e500e55cf31b7a5d59a38ab2040ab0f42f56
+        with:
+          context: .
+          push: false
+          load: true
+          tags: roapi:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/roapi:buildcache
+      - name: Test
+        run: |
+          docker run --rm roapi:latest --help
+          docker run --rm roapi:latest --version

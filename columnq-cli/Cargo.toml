@@ -1,0 +1,44 @@
+[package]
+name = "columnq-cli"
+version = "0.7.0"
+homepage = "https://github.com/roapi/roapi"
+license = "MIT"
+readme = "README.md"
+authors = ["QP Hou <dave2008713@gmail.com>"]
+edition = "2021"
+
+[[bin]]
+name = "columnq"
+path = "src/main.rs"
+
+[dependencies]
+columnq = { path = "../columnq", version = "0", default-features = false }
+# for datafusion optimization
+snmalloc-rs = { version = "0.3", optional = true }
+
+serde_json = "*"
+log = "0"
+tokio = "1"
+rustyline = { version = "9" }
+env_logger = { version = "0" }
+anyhow = { version = "1" }
+clap = { version = "4", features = ["color"] }
+dirs = { version = "4" }
+
+[features]
+default = ["rustls", "snmalloc"]
+rustls = ["columnq/rustls"]
+native-tls-vendored = ["columnq/native-tls-vendored"]
+native-tls = ["columnq/native-tls"]
+snmalloc = ["snmalloc-rs"]
+database-sqlite = ["columnq/database-sqlite"]
+database-mysql = ["columnq/database-mysql"]
+database = ["columnq/database"]
+
+[dev-dependencies]
+pretty_assertions = "*"
+
+# TODO: uncomment this when we exclude columnq-cli from root workspace
+# [profile.release]
+# lto = true
+# codegen-units = 1

@@ -1,41 +1,80 @@
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
-use arrow::record_batch::RecordBatch;
+use datafusion::arrow;
+use datafusion::arrow::datatypes::Schema;
+#[allow(deprecated)]
+use datafusion::arrow::json::reader::ReaderBuilder;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::TableProvider;
 use serde_json::value::Value;
+use snafu::prelude::*;
 
-use crate::error::ColumnQError;
-use crate::table::{TableLoadOption, TableSchema, TableSource};
+use crate::table::{self, LoadedTable, TableLoadOption, TableSchema, TableSource};
 
-fn json_value_from_reader<R: Read>(r: R) -> Result<Value, ColumnQError> {
-    serde_json::from_reader(r).map_err(ColumnQError::json_parse)
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to deserialize JSON: {source}"))]
+    Deserialize { source: serde_json::Error },
+    #[snafu(display("Array encoded option requires manually specified schema"))]
+    ArrayEncodedSchemaRequired {},
+    #[snafu(display("JSON data is an empty array"))]
+    EmptyArray {},
+    #[snafu(display("{pointer} points to an empty array"))]
+    EmptyArrayPointer { pointer: String },
+    #[snafu(display("Invalid json pinter: {pointer}"))]
+    InvalidPointer { pointer: String },
+    #[snafu(display("{stuff} is not an array"))]
+    NotAnArray { stuff: String },
+    #[snafu(display("Failed to infer schema: {source}"))]
+    InferSchema {
+        source: datafusion::arrow::error::ArrowError,
+    },
+    #[snafu(display("Failed to load schema"))]
+    SchemaNotFound {},
+    #[snafu(display("Failed build decoder: {source}"))]
+    BuildDecoder {
+        source: datafusion::arrow::error::ArrowError,
+    },
+    #[snafu(display("Failed to serialize objects: {source}"))]
+    Serialize {
+        source: datafusion::arrow::error::ArrowError,
+    },
+    #[snafu(display("No item found in JSON rows"))]
+    NoJsonRow {},
+    #[snafu(display("Array encoded JSON row missing column {index:?}: {row:?}"))]
+    ArrayEncodingMissingRow { index: usize, row: Value },
+}
+
+fn json_value_from_reader<R: Read>(r: R) -> Result<Value, table::Error> {
+    let reader = BufReader::new(r);
+    serde_json::from_reader(reader)
+        .context(DeserializeSnafu)
+        .context(table::LoadJsonSnafu)
 }
 
 fn json_partition_to_vec(
     json_partition: &Value,
     pointer: Option<&str>,
-) -> Result<Vec<Value>, ColumnQError> {
+) -> Result<Vec<Value>, Error> {
     let mut value_ref = json_partition;
 
     if let Some(p) = pointer {
         match value_ref.pointer(p) {
             Some(v) => value_ref = v,
             None => {
-                return Err(ColumnQError::LoadJson(format!(
-                    "Invalid json pointer: {}",
-                    p
-                )))
+                return Err(Error::InvalidPointer {
+                    pointer: p.to_string(),
+                })
             }
         }
     }
 
     match value_ref.as_array() {
         Some(arr) => Ok(arr.to_vec()),
-        None => Err(ColumnQError::LoadJson(format!(
-            "{} is not an array",
-            pointer.unwrap_or("JSON data")
-        ))),
+        None => Err(Error::NotAnArray {
+            stuff: pointer.unwrap_or("JSON data").to_string(),
+        }),
     }
 }
 
@@ -44,28 +83,29 @@ fn json_vec_to_partition(
     provided_schema: &Option<TableSchema>,
     batch_size: usize,
     array_encoded: bool,
-) -> Result<(arrow::datatypes::Schema, Vec<RecordBatch>), ColumnQError> {
+) -> Result<(arrow::datatypes::Schema, Vec<RecordBatch>), Error> {
     // load schema
     let schema = match provided_schema {
         Some(s) => s.into(),
         None => arrow::json::reader::infer_json_schema_from_iterator(
             json_rows.iter().map(|v| Ok(v.clone())),
         )
-        .map_err(|e| {
-            ColumnQError::LoadJson(format!("Failed to infer schema from JSON data: {}", e))
-        })?,
+        .context(InferSchemaSnafu)?,
     };
 
-    // decode to arrow record batch
-    let decoder = arrow::json::reader::Decoder::new(Arc::new(schema.clone()), batch_size, None);
-    let batch = {
-        // enclose values_iter in its own scope so it won't brrow schema_ref til end of this
-        // function
-        let mut values_iter: Box<dyn Iterator<Item = arrow::error::Result<Value>>>;
-        values_iter = if array_encoded {
-            // convert row array to object based on schema
-            // TODO: support array_encoded read in upstream arrow json reader instead
-            Box::new(json_rows.into_iter().map(|json_row| {
+    // TODO: batch_size setting here doesn't work because we are invoking serialize directly. might
+    // be better to break up the batch ourselives.
+    let mut decoder = ReaderBuilder::new(Arc::new(schema.clone()))
+        .with_batch_size(batch_size)
+        .build_decoder()
+        .context(BuildDecoderSnafu)?;
+
+    if array_encoded {
+        // convert row array to object based on schema
+        // TODO: support array_encoded read in upstream arrow json reader instead
+        let objects = json_rows
+            .into_iter()
+            .map(|json_row| {
                 let mut m = serde_json::map::Map::new();
                 schema.fields().iter().enumerate().try_for_each(|(i, f)| {
                     match json_row.get(i) {
@@ -73,47 +113,44 @@ fn json_vec_to_partition(
                             m.insert(f.name().to_string(), x.clone());
                             Ok(())
                         }
-                        None => Err(arrow::error::ArrowError::JsonError(format!(
-                            "arry encoded JSON row missing column {:?} : {:?}",
-                            i, json_row
-                        ))),
+                        None => Err(Error::ArrayEncodingMissingRow {
+                            index: i,
+                            row: json_row.clone(),
+                        }),
                     }
                 })?;
                 Ok(Value::Object(m))
-            }))
-        } else {
-            // no need to convert row since each row is already an object
-            Box::new(json_rows.into_iter().map(Ok))
-        };
+            })
+            .collect::<Result<Vec<Value>, Error>>()?;
 
-        // decode whole array into single record batch
-        decoder
-            .next_batch(&mut values_iter)
-            .map_err(|e| {
-                ColumnQError::LoadJson(format!("Failed decode JSON into Arrow record batch: {}", e))
-            })?
-            .ok_or_else(|| {
-                ColumnQError::LoadJson("JSON data results in empty arrow record batch".to_string())
-            })?
+        // TODO: avoid unnecessary collection here, update upstream json reader to take an iterator
+        // instead of slice
+        decoder.serialize(&objects).context(SerializeSnafu)?;
+    } else {
+        // Note: serialize ignores any batch size setting, and always decodes all rows
+        decoder.serialize(&json_rows).context(SerializeSnafu)?;
     };
+
+    let batch = decoder
+        .flush()
+        .context(SerializeSnafu)?
+        .context(NoJsonRowSnafu)?;
 
     Ok((schema, vec![batch]))
 }
 
-pub async fn to_mem_table(
+async fn to_partitions(
     t: &TableSource,
-) -> Result<datafusion::datasource::MemTable, ColumnQError> {
-    // TODO: make batch size configurable
-    let batch_size = 1024;
+    dfctx: &datafusion::execution::context::SessionContext,
+) -> Result<(Option<Schema>, Vec<Vec<RecordBatch>>), table::Error> {
+    let batch_size = t.batch_size;
     let array_encoded = match &t.option {
         Some(TableLoadOption::json { array_encoded, .. }) => array_encoded.unwrap_or(false),
         _ => false,
     };
 
     if array_encoded && t.schema.is_none() {
-        return Err(ColumnQError::LoadJson(
-            "Array encoded option requires manually specified schema".to_string(),
-        ));
+        return Err(Error::ArrayEncodedSchemaRequired {}).context(table::LoadJsonSnafu);
     }
 
     let pointer = match &t.option {
@@ -122,66 +159,136 @@ pub async fn to_mem_table(
     };
 
     let mut merged_schema: Option<Schema> = None;
-    let json_partitions: Vec<Value> = partitions_from_table_source!(t, json_value_from_reader)?;
+    let json_partitions: Vec<Value> =
+        partitions_from_table_source!(t, json_value_from_reader, dfctx).context(table::IoSnafu)?;
 
     let partitions = json_partitions
         .iter()
         .map(|json_partition| {
-            let json_rows = json_partition_to_vec(json_partition, pointer.as_deref())?;
+            let json_rows = json_partition_to_vec(json_partition, pointer.as_deref())
+                .context(table::LoadJsonSnafu)?;
             if json_rows.is_empty() {
                 match &pointer {
                     Some(p) => {
-                        return Err(ColumnQError::LoadJson(format!(
-                            "{} points to an emtpy array",
-                            p
-                        )));
+                        return Err(Error::EmptyArrayPointer {
+                            pointer: p.to_string(),
+                        })
+                        .context(table::LoadJsonSnafu);
                     }
                     None => {
-                        return Err(ColumnQError::LoadJson(
-                            "JSON data is an emtpy array".to_string(),
-                        ));
+                        return Err(Error::EmptyArray {}).context(table::LoadJsonSnafu);
                     }
                 }
             }
 
             let (batch_schema, partition) =
-                json_vec_to_partition(json_rows, &t.schema, batch_size, array_encoded)?;
+                json_vec_to_partition(json_rows, &t.schema, batch_size, array_encoded)
+                    .context(table::LoadJsonSnafu)?;
 
             merged_schema = Some(match &merged_schema {
-                Some(s) if s != &batch_schema => Schema::try_merge(vec![s.clone(), batch_schema])?,
+                Some(s) if s != &batch_schema => Schema::try_merge(vec![s.clone(), batch_schema])
+                    .context(table::MergeSchemaSnafu)?,
                 _ => batch_schema,
             });
 
             Ok(partition)
         })
-        .collect::<Result<Vec<Vec<RecordBatch>>, ColumnQError>>()?;
+        .collect::<Result<Vec<Vec<RecordBatch>>, table::Error>>()?;
 
-    Ok(datafusion::datasource::MemTable::try_new(
+    Ok((merged_schema, partitions))
+}
+
+pub async fn to_mem_table(
+    t: &TableSource,
+    dfctx: &datafusion::execution::context::SessionContext,
+) -> Result<datafusion::datasource::MemTable, table::Error> {
+    let (merged_schema, partitions) = to_partitions(t, dfctx).await?;
+    datafusion::datasource::MemTable::try_new(
         Arc::new(
             merged_schema
-                .ok_or_else(|| ColumnQError::LoadJson("failed to load schema".to_string()))?,
+                .ok_or(Error::SchemaNotFound {})
+                .context(table::LoadJsonSnafu)?,
         ),
         partitions,
-    )?)
+    )
+    .context(table::CreateMemTableSnafu)
+}
+
+async fn to_datafusion_table(
+    t: TableSource,
+    dfctx: datafusion::execution::context::SessionContext,
+) -> Result<Arc<dyn TableProvider>, table::Error> {
+    Ok(Arc::new(to_mem_table(&t, &dfctx).await?))
+}
+
+pub async fn to_loaded_table(
+    t: TableSource,
+    dfctx: datafusion::execution::context::SessionContext,
+) -> Result<LoadedTable, table::Error> {
+    LoadedTable::new_from_df_table_cb(move || to_datafusion_table(t.clone(), dfctx.clone())).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
-    use datafusion::datasource::TableProvider;
+    use datafusion::{datasource::TableProvider, prelude::SessionContext};
 
     use crate::test_util::*;
 
     #[tokio::test]
-    async fn nested_struct_and_lists() -> Result<(), ColumnQError> {
-        let t = to_mem_table(&TableSource {
-            name: "spacex_launches".to_string(),
-            uri: test_data_path("spacex-launches.json"),
-            schema: None,
-            option: None,
-        })
-        .await?;
+    async fn nested_struct_and_lists() {
+        let json_content = r#"[
+          {
+            "foo": [
+              {
+                "bar": "1234",
+                "baz": 1
+              }
+            ]
+          }
+        ]"#;
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp_file_path = tmp_dir.path().join("nested.json");
+        let mut f = std::fs::File::create(tmp_file_path.clone()).unwrap();
+        writeln!(f, "{}", json_content).unwrap();
+
+        let ctx = SessionContext::new();
+        let t = to_mem_table(
+            &TableSource::new(
+                "nested_json".to_string(),
+                format!("{}", tmp_file_path.to_string_lossy()),
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let schema = t.schema();
+        let fields = schema.fields();
+
+        let mut obj_keys = fields.iter().map(|f| f.name()).collect::<Vec<_>>();
+        obj_keys.sort();
+        let mut expected_obj_keys = vec!["foo"];
+        expected_obj_keys.sort();
+
+        assert_eq!(obj_keys, expected_obj_keys);
+    }
+
+    #[tokio::test]
+    async fn spacex_launches() {
+        let ctx = SessionContext::new();
+        let t = to_mem_table(
+            &TableSource::new(
+                "spacex_launches".to_string(),
+                test_data_path("spacex_launches.json"),
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         let schema = t.schema();
         let fields = schema.fields();
@@ -220,7 +327,20 @@ mod tests {
         expected_obj_keys.sort();
 
         assert_eq!(obj_keys, expected_obj_keys);
+    }
 
-        Ok(())
+    #[tokio::test]
+    async fn test_multiple_batches() {
+        let ctx = SessionContext::new();
+        let mut source = TableSource::new(
+            "spacex_launches".to_string(),
+            test_data_path("spacex_launches.json"),
+        );
+        source.batch_size = 1;
+        let (_, p) = to_partitions(&source, &ctx).await.unwrap();
+        assert_eq!(p.len(), 1);
+        let batch = &p[0];
+        assert_eq!(batch[0].num_rows(), 132);
+        assert_eq!(batch.len(), source.batch_size);
     }
 }

@@ -1,18 +1,55 @@
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
-use arrow::array::{ArrayRef, BooleanArray, PrimitiveArray, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::datatypes::{Float64Type, Int64Type};
-use arrow::record_batch::RecordBatch;
+use datafusion::arrow::array::{ArrayRef, BooleanArray, PrimitiveArray, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{Float64Type, Int64Type};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::TableProvider;
 use regex::Regex;
 use reqwest::Client;
 use serde_derive::Deserialize;
+use snafu::prelude::*;
 use uriparse::URIReference;
 
-use crate::error::ColumnQError;
-use crate::table::{TableOptionGoogleSpreasheet, TableSource};
+use crate::table::{self, LoadedTable, TableOptionGoogleSpreadsheet, TableSource};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to build http client: {source}"))]
+    BuildHttpClient { source: reqwest::Error },
+    #[snafu(display("Failed to send API request: {source}"))]
+    SendRequest { source: reqwest::Error },
+    #[snafu(display("Expect int64 value, got: {value}"))]
+    ExpectI64 { value: String },
+    #[snafu(display("Expect float64 value, got: {value}"))]
+    ExpectFloat64 { value: String },
+    #[snafu(display("Failed to create record batch"))]
+    CreateRecordBatch {
+        source: datafusion::arrow::error::ArrowError,
+    },
+    #[snafu(display("Failed to read applicatin secret from disk: {source}"))]
+    ReadAppSecret { source: std::io::Error },
+    #[snafu(display("Failed to build service account authenticator: {source}"))]
+    BuildAuthenticator { source: std::io::Error },
+    #[snafu(display("Failed to obtain Oauth2 token: {source}"))]
+    ObtainToken { source: yup_oauth2::Error },
+    #[snafu(display("Oauth2 token not found"))]
+    EmptyToken {},
+    #[snafu(display("Failed to resolve sheet title: {source}"))]
+    ResolveTitle { source: reqwest::Error },
+    #[snafu(display("Failed to parse API response: {source}"))]
+    ParseApiResp { source: reqwest::Error },
+    #[snafu(display("Failed to load sheet value from API: {source}"))]
+    HttpStatus { source: reqwest::Error },
+    #[snafu(display("Googlesheet is empty"))]
+    EmptySheet {},
+    #[snafu(display("Invalid sheet id: {id}"))]
+    InvalidSheetId { id: String },
+    #[snafu(display("Invalid URI: {uri}"))]
+    InvalidUri { uri: String },
+}
 
 // steps
 // * Activate the Google Sheets API in the Google API Console.
@@ -56,6 +93,7 @@ struct Spreadsheets {
     // see: https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct SpreadsheetValues {
     range: String,
@@ -79,25 +117,15 @@ fn infer_value_type(v: &str) -> DataType {
 }
 
 // util wrapper for calling google spreadsheet API
-async fn gs_api_get(token: &str, url: &str) -> Result<reqwest::Response, ColumnQError> {
+async fn gs_api_get(token: &str, url: &str) -> Result<reqwest::Response, Error> {
     Client::builder()
         .build()
-        .map_err(|e| {
-            ColumnQError::GoogleSpeadsheets(format!(
-                "Failed to initialize HTTP client: {}",
-                e.to_string()
-            ))
-        })?
+        .context(BuildHttpClientSnafu)?
         .get(url)
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| {
-            ColumnQError::GoogleSpeadsheets(format!(
-                "Failed to send API request: {}",
-                e.to_string()
-            ))
-        })
+        .context(SendRequestSnafu)
 }
 
 fn coerce_type(l: DataType, r: DataType) -> DataType {
@@ -128,7 +156,7 @@ fn infer_schema(rows: &[Vec<String>]) -> Schema {
         row.iter().enumerate().for_each(|(i, col_val)| {
             let col_name = &col_names[i];
             let col_type = infer_value_type(col_val);
-            let entry = col_types.entry(col_name).or_insert_with(HashSet::new);
+            let entry = col_types.entry(col_name).or_default();
             entry.insert(col_type);
         });
     });
@@ -148,7 +176,7 @@ fn infer_schema(rows: &[Vec<String>]) -> Schema {
             let dt = dt_iter.fold(dt_init, coerce_type);
 
             // normalize column name by replacing space with under score
-            Field::new(&col_name.replace(" ", "_"), dt, false)
+            Field::new(col_name.replace(' ', "_"), dt, true)
         })
         .collect();
     Schema::new(fields)
@@ -158,7 +186,7 @@ fn parse_boolean(s: &str) -> bool {
     s.eq_ignore_ascii_case("true")
 }
 
-fn sheet_values_to_record_batch(values: &[Vec<String>]) -> Result<RecordBatch, ColumnQError> {
+fn sheet_values_to_record_batch(values: &[Vec<String>]) -> Result<RecordBatch, Error> {
     let schema = infer_schema(values);
 
     let arrays = schema
@@ -172,99 +200,81 @@ fn sheet_values_to_record_batch(values: &[Vec<String>]) -> Result<RecordBatch, C
             Ok(match field.data_type() {
                 DataType::Boolean => Arc::new(
                     rows_iter
-                        .map(|row| Some(parse_boolean(&row[i])))
+                        .map(|row| row.get(i).map(|v| parse_boolean(v)))
                         .collect::<BooleanArray>(),
                 ) as ArrayRef,
                 DataType::Int64 => Arc::new(
                     rows_iter
                         .map(|row| {
-                            Ok(Some(row[i].parse::<i64>().map_err(|_| {
-                                ColumnQError::GoogleSpeadsheets(format!(
-                                    "Expect int64 value, got: {}",
-                                    row[i]
-                                ))
-                            })?))
+                            row.get(i)
+                                .map(|v| {
+                                    v.parse::<i64>().map_err(|_| Error::ExpectI64 {
+                                        value: row[i].clone(),
+                                    })
+                                })
+                                .transpose()
                         })
-                        .collect::<Result<PrimitiveArray<Int64Type>, ColumnQError>>()?,
+                        .collect::<Result<PrimitiveArray<Int64Type>, Error>>()?,
                 ) as ArrayRef,
                 DataType::Float64 => Arc::new(
                     rows_iter
                         .map(|row| {
-                            Ok(Some(row[i].parse::<f64>().map_err(|_| {
-                                ColumnQError::GoogleSpeadsheets(format!(
-                                    "Expect float64 value, got: {}",
-                                    row[i]
-                                ))
-                            })?))
+                            row.get(i)
+                                .map(|v| {
+                                    v.parse::<f64>().map_err(|_| Error::ExpectFloat64 {
+                                        value: row[i].clone(),
+                                    })
+                                })
+                                .transpose()
                         })
-                        .collect::<Result<PrimitiveArray<Float64Type>, ColumnQError>>()?,
+                        .collect::<Result<PrimitiveArray<Float64Type>, Error>>()?,
                 ) as ArrayRef,
 
-                _ => Arc::new(rows_iter.map(|row| Some(&row[i])).collect::<StringArray>())
-                    as ArrayRef,
+                _ => Arc::new(rows_iter.map(|row| row.get(i)).collect::<StringArray>()) as ArrayRef,
             })
         })
-        .collect::<Result<Vec<ArrayRef>, ColumnQError>>()?;
+        .collect::<Result<Vec<ArrayRef>, Error>>()?;
 
-    Ok(RecordBatch::try_new(Arc::new(schema), arrays)?)
+    RecordBatch::try_new(Arc::new(schema), arrays).context(CreateRecordBatchSnafu)
 }
 
 async fn fetch_auth_token(
-    opt: &TableOptionGoogleSpreasheet,
-) -> Result<yup_oauth2::AccessToken, ColumnQError> {
+    opt: &TableOptionGoogleSpreadsheet,
+) -> Result<yup_oauth2::AccessToken, Error> {
     // Read application creds from a file.The clientsecret file contains JSON like
     // `{"installed":{"client_id": ... }}`
     let creds = yup_oauth2::read_service_account_key(&opt.application_secret_path)
         .await
-        .map_err(|e| {
-            ColumnQError::GoogleSpeadsheets(format!(
-                "Error reading application secret from disk: {}",
-                e.to_string()
-            ))
-        })?;
+        .context(ReadAppSecretSnafu)?;
 
     let sa = yup_oauth2::ServiceAccountAuthenticator::builder(creds)
         .build()
         .await
-        .map_err(|e| {
-            ColumnQError::GoogleSpeadsheets(format!(
-                "Error building service account authenticator: {}",
-                e.to_string()
-            ))
-        })?;
+        .context(BuildAuthenticatorSnafu)?;
 
     let scopes = &["https://www.googleapis.com/auth/spreadsheets.readonly"];
 
-    sa.token(scopes).await.map_err(|e| {
-        ColumnQError::GoogleSpeadsheets(format!("Failed to obtain OAuth2 token: {}", e.to_string()))
-    })
+    sa.token(scopes).await.context(ObtainTokenSnafu)
 }
 
-async fn resolve_sheet_title<'a, 'b, 'c, 'd>(
-    token: &'a str,
-    spreadsheet_id: &'b str,
-    uri: &'c URIReference<'d>,
-) -> Result<String, ColumnQError> {
+async fn resolve_sheet_title(
+    token: &str,
+    spreadsheet_id: &str,
+    uri: &URIReference<'_>,
+) -> Result<String, Error> {
     // look up sheet title by sheet id through API
     let resp = gs_api_get(
         token,
-        &format!(
-            "https://sheets.googleapis.com/v4/spreadsheets/{}",
-            spreadsheet_id
-        ),
+        &format!("https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}"),
     )
     .await?
     .error_for_status()
-    .map_err(|e| {
-        ColumnQError::GoogleSpeadsheets(format!(
-            "Failed to resolve sheet title from API: {}",
-            e.to_string()
-        ))
-    })?;
+    .context(ResolveTitleSnafu)?;
 
-    let spreadsheets = resp.json::<Spreadsheets>().await.map_err(|e| {
-        ColumnQError::GoogleSpeadsheets(format!("Failed to parse API response: {}", e.to_string()))
-    })?;
+    let spreadsheets = resp
+        .json::<Spreadsheets>()
+        .await
+        .context(ParseApiRespSnafu)?;
 
     // when sheet id is not specified from config, try to parse it from URI
     let sheet_id: Option<usize> = match uri.fragment() {
@@ -288,78 +298,110 @@ async fn resolve_sheet_title<'a, 'b, 'c, 'd>(
             .sheets
             .iter()
             .find(|s| s.properties.sheet_id == id)
-            .ok_or_else(|| ColumnQError::GoogleSpeadsheets(format!("Invalid sheet id {}", id)))?,
+            .ok_or_else(|| Error::InvalidSheetId { id: id.to_string() })?,
         // no sheet id specified, default to the first sheet
         None => spreadsheets
             .sheets
             .iter()
             .find(|s| s.properties.index == 0)
-            .ok_or_else(|| ColumnQError::GoogleSpeadsheets("spreadsheets is empty".to_string()))?,
+            .ok_or(Error::EmptySheet {})?,
     };
 
     Ok(sheet.properties.title.clone())
 }
 
-pub async fn to_mem_table(
-    t: &TableSource,
-) -> Result<datafusion::datasource::MemTable, ColumnQError> {
-    lazy_static! {
-        static ref RE_GOOGLE_SHEET: Regex =
-            Regex::new(r"https://docs.google.com/spreadsheets/d/(.+)").unwrap();
-    }
-    if RE_GOOGLE_SHEET.captures(&t.uri).is_none() {
-        return Err(ColumnQError::InvalidUri(t.uri.to_string()));
+#[derive(Clone)]
+struct GetReqContext {
+    token: yup_oauth2::AccessToken,
+    url: String,
+}
+
+static RE_GOOGLE_SHEET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https://docs.google.com/spreadsheets/d/(.+)").unwrap());
+
+async fn gs_get_req_contex(t: &TableSource) -> Result<GetReqContext, table::Error> {
+    let uri_str = t.get_uri_str();
+    if RE_GOOGLE_SHEET.captures(uri_str).is_none() {
+        return Err(Error::InvalidUri {
+            uri: uri_str.to_string(),
+        })
+        .context(table::LoadGoogleSheetSnafu);
     }
 
-    let uri = URIReference::try_from(t.uri.as_str())?;
+    let uri = URIReference::try_from(uri_str).context(table::InvalidUriReferenceSnafu)?;
     let spreadsheet_id = uri.path().segments()[2].as_str();
 
     let opt = t
         .option
         .as_ref()
-        .ok_or(ColumnQError::MissingOption)?
-        .as_google_spreadsheet_opt()?;
+        .ok_or(table::Error::MissingOption {})?
+        .as_google_spreadsheet()?;
 
-    let token = fetch_auth_token(&opt).await?;
-    let token_str = token.as_str();
+    let token = fetch_auth_token(opt)
+        .await
+        .context(table::LoadGoogleSheetSnafu)?;
+    let token_str = token
+        .token()
+        .ok_or(Error::EmptyToken {})
+        .context(table::LoadGoogleSheetSnafu)?;
 
     let sheet_title = match &opt.sheet_title {
         Some(t) => t.clone(),
-        None => resolve_sheet_title(token_str, spreadsheet_id, &uri).await?,
+        None => resolve_sheet_title(token_str, spreadsheet_id, &uri)
+            .await
+            .context(table::LoadGoogleSheetSnafu)?,
     };
 
-    let resp = gs_api_get(
-        token_str,
-        &format!(
-            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}",
-            spreadsheet_id, sheet_title,
+    Ok(GetReqContext {
+        token,
+        url: format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{sheet_title}"
         ),
-    )
-    .await?
-    .error_for_status()
-    .map_err(|e| {
-        ColumnQError::GoogleSpeadsheets(format!(
-            "Failed to load sheet value from API: {}",
-            e.to_string()
-        ))
-    })?;
+    })
+}
 
-    let sheet = resp.json::<SpreadsheetValues>().await.map_err(|e| {
-        ColumnQError::GoogleSpeadsheets(format!("Failed to parse API response: {}", e.to_string()))
-    })?;
+async fn to_mem_table(
+    ctx: GetReqContext,
+) -> Result<datafusion::datasource::MemTable, table::Error> {
+    let token_str = ctx
+        .token
+        .token()
+        .ok_or(Error::EmptyToken {})
+        .context(table::LoadGoogleSheetSnafu)?;
+    let resp = gs_api_get(token_str, &ctx.url)
+        .await
+        .context(table::LoadGoogleSheetSnafu)?
+        .error_for_status()
+        .context(HttpStatusSnafu)
+        .context(table::LoadGoogleSheetSnafu)?;
 
-    let batch = sheet_values_to_record_batch(&sheet.values)?;
+    let sheet = resp
+        .json::<SpreadsheetValues>()
+        .await
+        .context(ParseApiRespSnafu)
+        .context(table::LoadGoogleSheetSnafu)?;
+
+    let batch = sheet_values_to_record_batch(&sheet.values).context(table::LoadGoogleSheetSnafu)?;
     let schema_ref = batch.schema();
     let partitions = vec![vec![batch]];
-    Ok(datafusion::datasource::MemTable::try_new(
-        schema_ref, partitions,
-    )?)
+
+    datafusion::datasource::MemTable::try_new(schema_ref, partitions)
+        .context(table::CreateMemTableSnafu)
+}
+
+pub async fn to_loaded_table(t: &TableSource) -> Result<LoadedTable, table::Error> {
+    let ctx = gs_get_req_contex(t).await?;
+    let to_datafusion_table = move || {
+        let ctx = ctx.clone();
+        async { Ok(Arc::new(to_mem_table(ctx).await?) as Arc<dyn TableProvider>) }
+    };
+    LoadedTable::new_from_df_table_cb(to_datafusion_table).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{BooleanArray, Int64Array};
+    use datafusion::arrow::array::Int64Array;
 
     fn row(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
@@ -436,23 +478,23 @@ mod tests {
         assert_eq!(
             schema,
             Schema::new(vec![
-                Field::new("Address", DataType::Utf8, false),
-                Field::new("Image", DataType::Utf8, false),
-                Field::new("Landlord", DataType::Utf8, false),
-                Field::new("Bed", DataType::Int64, false),
-                Field::new("Bath", DataType::Int64, false),
-                Field::new("Occupied", DataType::Boolean, false),
-                Field::new("Monthly_Rent", DataType::Utf8, false),
-                Field::new("Lease_Expiration_Date", DataType::Utf8, false),
-                Field::new("Days_Until_Expiration", DataType::Utf8, false),
+                Field::new("Address", DataType::Utf8, true),
+                Field::new("Image", DataType::Utf8, true),
+                Field::new("Landlord", DataType::Utf8, true),
+                Field::new("Bed", DataType::Int64, true),
+                Field::new("Bath", DataType::Int64, true),
+                Field::new("Occupied", DataType::Boolean, true),
+                Field::new("Monthly_Rent", DataType::Utf8, true),
+                Field::new("Lease_Expiration_Date", DataType::Utf8, true),
+                Field::new("Days_Until_Expiration", DataType::Utf8, true),
             ])
         );
     }
 
     #[test]
-    fn sheetvalue_to_record_batch() -> anyhow::Result<()> {
+    fn sheetvalue_to_record_batch() {
         let sheet = property_sheet();
-        let batch = sheet_values_to_record_batch(&sheet.values)?;
+        let batch = sheet_values_to_record_batch(&sheet.values).unwrap();
 
         assert_eq!(batch.num_columns(), 9);
         assert_eq!(
@@ -467,7 +509,67 @@ mod tests {
             batch.column(2).as_ref(),
             Arc::new(StringArray::from(vec!["Roger", "Sam", "Daniel", "Roger"])).as_ref(),
         );
+    }
 
-        Ok(())
+    #[test]
+    fn unaligned_sheetvalue_to_record_batch() {
+        // empty cells at the end of a row will not be returned from the server
+        let sheet = SpreadsheetValues {
+            range: "Properties!A1:AB1000".to_string(),
+            major_dimension: "ROWS".to_string(),
+            values: vec![
+                row(&[
+                    "Address",
+                    "Image",
+                    "Landlord",
+                    "Bed",
+                    "Bath",
+                    "Occupied",
+                    "Monthly Rent",
+                    "Lease Expiration Date",
+                    "Days Until Expiration",
+                ]),
+                row(&[
+                    "Bothell, WA",
+                    "https://a.com/1.jpeg",
+                    "Roger",
+                    "3",
+                    "2",
+                    "FALSE",
+                    "$2,000",
+                    "10/23/2020",
+                    "Expired",
+                ]),
+                row(&[
+                    "Shoreline, WA",
+                    "https://a.com/3.jpeg",
+                    "Roger",
+                    "1",
+                    "1",
+                    "TRUE",
+                    "$1,200",
+                ]),
+            ],
+        };
+
+        let batch = sheet_values_to_record_batch(&sheet.values).unwrap();
+
+        assert_eq!(batch.num_columns(), 9);
+        assert_eq!(
+            batch.column(3).as_ref(),
+            Arc::new(Int64Array::from(vec![3, 1])).as_ref(),
+        );
+        assert_eq!(
+            batch.column(5).as_ref(),
+            Arc::new(BooleanArray::from(vec![false, true])).as_ref(),
+        );
+        assert_eq!(
+            batch.column(2).as_ref(),
+            Arc::new(StringArray::from(vec!["Roger", "Roger"])).as_ref(),
+        );
+        assert_eq!(
+            batch.column(8).as_ref(),
+            Arc::new(StringArray::from(vec![Some("Expired"), None])).as_ref(),
+        );
     }
 }
